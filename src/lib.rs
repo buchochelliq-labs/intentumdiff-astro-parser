@@ -263,14 +263,53 @@ fn extract_frontmatter_children(
     children
 }
 
+// Scan original UTF-8 source, not whitespace-separated fragments: Astro/JSX
+// values can contain spaces, quotes and comparisons without creating attributes.
+fn attribute_token_ranges(attrs: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut braces = 0_usize;
+
+    for (idx, ch) in attrs.char_indices() {
+        if ch.is_whitespace() && quote.is_none() && braces == 0 {
+            if let Some(begin) = start.take() {
+                ranges.push((begin, idx));
+            }
+            continue;
+        }
+        if start.is_none() {
+            start = Some(idx);
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' => braces += 1,
+            '}' if braces > 0 => braces -= 1,
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        ranges.push((begin, attrs.len()));
+    }
+    ranges
+}
+
 fn parse_attr_labels(attrs: &str) -> Vec<(String, usize, usize)> {
-    // Offsets are relative to the original attribute source (UTF-8 bytes).
-    let mut cursor = 0;
-    attrs
-        .split_whitespace()
-        .filter_map(|part| {
-            let token_start = cursor + attrs[cursor..].find(part)?;
-            cursor = token_start + part.len();
+    attribute_token_ranges(attrs)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let part = &attrs[start..end];
             let clean = part.trim().trim_end_matches('>').trim_end_matches('/').trim();
             if clean.is_empty() {
                 return None;
@@ -287,7 +326,7 @@ fn parse_attr_labels(attrs: &str) -> Vec<(String, usize, usize)> {
                     .trim_matches('{').trim_matches('}');
                 format!("{}={}", name, value)
             };
-            Some((label, token_start, cursor))
+            Some((label, start, end))
         })
         .collect()
 }
@@ -337,6 +376,35 @@ fn extract_brace_labels(line: &str) -> Vec<(String, usize, usize)> {
     labels
 }
 
+
+ // '>' ends a tag only outside quoted/JSX attribute values. All offsets are
+ // byte offsets from char_indices so multibyte UTF-8 prefixes stay anchored.
+fn find_tag_close(after_open: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut braces = 0_usize;
+    for (idx, ch) in after_open.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' => braces += 1,
+            '}' if braces > 0 => braces -= 1,
+            '>' if braces == 0 => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) -> Vec<SemanticNode> {
     let mut children = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
@@ -344,7 +412,7 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
         let mut rest = line;
         while let Some(open_idx) = rest.find('<') {
             let after_open = &rest[open_idx + 1..];
-            if let Some(close_idx) = after_open.find('>') {
+            if let Some(close_idx) = find_tag_close(after_open) {
                 let segment = &after_open[..close_idx];
                 if let Some((tag, attrs)) = parse_tag_segment(segment) {
                     // Account for already-consumed tags and UTF-8 prefixes.
@@ -670,6 +738,57 @@ mod tests {
             "start_line": 0, "start_col": start,
             "end_line": 0, "end_col": start + raw.len() as u64
         }));
+    }
+
+
+    #[test]
+    fn attribute_spans_preserve_quoted_whitespace_gt_and_unicode() {
+        let src = "<a title=\"first > second\" data-note='café au lait'></a><a title=\"after\"/>";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        for (label, raw) in [
+            ("title=first > second", "title=\"first > second\""),
+            ("data-note=café au lait", "data-note='café au lait'"),
+            ("title=after", "title=\"after\""),
+        ] {
+            let child = find_label(&tree, label)
+                .unwrap_or_else(|| panic!("missing original attribute: {label}"));
+            let start = src.find(raw).unwrap() as u64;
+            assert_eq!(child["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
+        }
+        assert!(find_label(&tree, "second\"").is_none(),
+            "quoted whitespace must not fabricate an attribute");
+    }
+
+    #[test]
+    fn attribute_spans_preserve_braced_comparisons_and_spacing() {
+        let src = "<button disabled={value > 1 ? true : false} title=\"a b\">go</button>";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        for (label, raw) in [
+            ("disabled=value > 1 ? true : false", "disabled={value > 1 ? true : false}"),
+            ("title=a b", "title=\"a b\""),
+        ] {
+            let child = find_label(&tree, label)
+                .unwrap_or_else(|| panic!("missing JSX attribute: {label}"));
+            let start = src.find(raw).unwrap() as u64;
+            assert_eq!(child["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
+        }
+    }
+
+    #[test]
+    fn unfinished_quoted_attrs_do_not_panic_or_fabricate_complete_spans() {
+        for src in ["<meta title=\"unfinished >", "<p title={unfinished >"] {
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+            assert!(tree.is_object());
+        }
     }
 
     fn find_label<'a>(value: &'a serde_json::Value, label: &str)
