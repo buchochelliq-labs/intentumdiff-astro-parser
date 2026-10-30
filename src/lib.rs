@@ -283,9 +283,11 @@ fn attribute_token_ranges(attrs: &str) -> Vec<(usize, usize)> {
             start = Some(idx);
         }
         if let Some(active_quote) = quote {
-            if escaped {
+            // HTML quoted attributes use literal backslashes. Only JS strings
+            // inside braced Astro/JSX expressions have backslash escaping.
+            if braces > 0 && escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if braces > 0 && ch == '\\' {
                 escaped = true;
             } else if ch == active_quote {
                 quote = None;
@@ -293,7 +295,8 @@ fn attribute_token_ranges(attrs: &str) -> Vec<(usize, usize)> {
             continue;
         }
         match ch {
-            '"' | '\'' | '`' => quote = Some(ch),
+            '"' | '\'' => quote = Some(ch),
+            '`' if braces > 0 => quote = Some(ch),
             '{' => braces += 1,
             '}' if braces > 0 => braces -= 1,
             _ => {}
@@ -385,9 +388,11 @@ fn find_tag_close(after_open: &str) -> Option<usize> {
     let mut braces = 0_usize;
     for (idx, ch) in after_open.char_indices() {
         if let Some(active_quote) = quote {
-            if escaped {
+            // HTML quoted attributes use literal backslashes. Only JS strings
+            // inside braced Astro/JSX expressions have backslash escaping.
+            if braces > 0 && escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if braces > 0 && ch == '\\' {
                 escaped = true;
             } else if ch == active_quote {
                 quote = None;
@@ -395,7 +400,8 @@ fn find_tag_close(after_open: &str) -> Option<usize> {
             continue;
         }
         match ch {
-            '"' | '\'' | '`' => quote = Some(ch),
+            '"' | '\'' => quote = Some(ch),
+            '`' if braces > 0 => quote = Some(ch),
             '{' => braces += 1,
             '}' if braces > 0 => braces -= 1,
             '>' if braces == 0 => return Some(idx),
@@ -405,26 +411,68 @@ fn find_tag_close(after_open: &str) -> Option<usize> {
     None
 }
 
+// Raw-text HTML elements do not interpret "<!--" inside script/style source.
+// Match only a real closing tag boundary, preserving original UTF-8 byte offsets.
+fn find_raw_text_close(rest: &str, tag: &str) -> Option<usize> {
+    let mut cursor = 0;
+    while let Some(relative) = rest[cursor..].find("</") {
+        let at = cursor + relative;
+        let remaining = &rest[at + 2..];
+        if remaining.get(..tag.len()).is_some_and(|name| name.eq_ignore_ascii_case(tag))
+            && remaining[tag.len()..].chars().next().is_some_and(
+                |ch| ch.is_whitespace() || ch == '>' || ch == '/'
+            )
+        {
+            return Some(at);
+        }
+        cursor = at + 2;
+    }
+    None
+}
+
 fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) -> Vec<SemanticNode> {
     let mut children = Vec::new();
     let mut in_html_comment = false;
+    let mut raw_text_tag: Option<String> = None;
     for (line_idx, line) in content.lines().enumerate() {
         let absolute_line = start_line + line_idx as u32;
         let mut rest = line;
+        // Mask only non-interpolation comment/raw-text bytes, preserving exact
+        // UTF-8 byte columns of all remaining source tokens.
+        let mut interpolation_visible = line.as_bytes().to_vec();
         loop {
-            // HTML comments are not tags. Skip their body before quote/brace
-            // tracking, even when a comment spans lines or contains "<" and "'".
+            // The contents of <script>/<style> are not HTML markup. In
+            // particular, a JS/CSS string containing "<!--" cannot open an
+            // HTML comment that consumes subsequent semantic elements.
+            if let Some(tag) = &raw_text_tag {
+                let offset = line.len() - rest.len();
+                if let Some(close) = find_raw_text_close(rest, tag) {
+                    interpolation_visible[offset..offset + close].fill(b' ');
+                    rest = &rest[close..];
+                    raw_text_tag = None;
+                } else {
+                    interpolation_visible[offset..].fill(b' ');
+                    break;
+                }
+            }
+            // HTML comments are not tags or interpolations. Skip their bytes
+            // before quote/brace tracking, even across multiple lines.
             if in_html_comment {
+                let offset = line.len() - rest.len();
                 if let Some(end) = rest.find("-->") {
+                    interpolation_visible[offset..offset + end + 3].fill(b' ');
                     rest = &rest[end + 3..];
                     in_html_comment = false;
                 } else {
+                    interpolation_visible[offset..].fill(b' ');
                     break;
                 }
             }
             let Some(open_idx) = rest.find('<') else { break };
             let after_open = &rest[open_idx + 1..];
             if after_open.starts_with("!--") {
+                let start = line.len() - rest.len() + open_idx;
+                interpolation_visible[start..start + 4].fill(b' ');
                 in_html_comment = true;
                 rest = &after_open[3..];
                 continue;
@@ -457,6 +505,9 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                             )
                         })
                         .collect();
+                    let is_raw_text = (tag == "script" || tag == "style")
+                        && !segment.trim_end().ends_with('/');
+                    let raw_name = if is_raw_text { Some(tag.clone()) } else { None };
                     children.push(
                         SemanticNodeBuilder::new(
                             &child_id, "element", tag,
@@ -467,13 +518,18 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                         .children(attr_children)
                         .build(),
                     );
+                    if let Some(raw_name) = raw_name {
+                        raw_text_tag = Some(raw_name);
+                    }
                 }
                 rest = &after_open[close_idx + 1..];
             } else {
                 break;
             }
         }
-        for (label, start, end) in extract_brace_labels(line) {
+        let visible = std::str::from_utf8(&interpolation_visible)
+            .expect("masking complete UTF-8 source ranges preserves encoding");
+        for (label, start, end) in extract_brace_labels(visible) {
             let child_id = format!("{}.{}", id_prefix, children.len());
             children.push(make_leaf(
                 &child_id, "interpolation", label, absolute_line,
@@ -857,6 +913,82 @@ mod tests {
             "start_line": 2, "start_col": start,
             "end_line": 2, "end_col": start + "id='kept'".len() as u64
         }));
+    }
+
+
+    #[test]
+    fn html_literal_backslash_does_not_escape_closing_attribute_quote() {
+        let src = r#"<div title="C:\"></div><p id="after"/>"#;
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        for (label, raw) in [
+            (r#"title=C:\"#, r#"title="C:\""#),
+            ("id=after", r#"id="after""#),
+        ] {
+            let attr = find_label(&tree, label)
+                .unwrap_or_else(|| panic!("missing HTML attribute: {label}"));
+            let start = src.find(raw).unwrap() as u64;
+            assert_eq!(attr["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
+        }
+    }
+
+    #[test]
+    fn javascript_string_escaping_inside_braces_still_works() {
+        let src = r#"<div title={value === "a\"b" ? 1 : 2}></div><p id="after"/>"#;
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        assert!(find_label(&tree, "id=after").is_some());
+        let raw = r#"title={value === "a\"b" ? 1 : 2}"#;
+        let start = src.find(raw).unwrap() as u64;
+        let attr = find_label(&tree, r#"title=value === "a\"b" ? 1 : 2"#)
+            .expect("braced JS string attribute survived");
+        assert_eq!(attr["position"], serde_json::json!({
+            "start_line": 0, "start_col": start,
+            "end_line": 0, "end_col": start + raw.len() as u64
+        }));
+    }
+
+    #[test]
+    fn raw_text_script_style_comment_markers_do_not_consume_later_tags() {
+        for (src, next_line) in [
+            ("<script>\nconst marker = \"<!--\";\n</script>\n<p id=\"after\"/>", 3),
+            ("<style>\np:after { content: \"<!--\"; }\n</style>\n<p id=\"after\"/>", 3),
+            ("<script>const marker=\"<!--\";</script><p id=\"after\"/>", 0),
+        ] {
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+            let attr = find_label(&tree, "id=after")
+                .expect("raw-text JS/CSS comment marker cannot hide following tag");
+            let line = src.lines().nth(next_line).unwrap();
+            let start = line.find("id=\"after\"").unwrap() as u64;
+            assert_eq!(attr["position"], serde_json::json!({
+                "start_line": next_line, "start_col": start,
+                "end_line": next_line, "end_col": start + "id=\"after\"".len() as u64
+            }));
+        }
+    }
+
+    #[test]
+    fn html_comments_never_create_fake_interpolations() {
+        let src = "<!-- {hidden} --> <p>{visible}</p>\n<!-- {also_hidden}\n more {also_hidden} --> <p>{also_visible}</p>";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        assert!(find_label(&tree, "hidden").is_none());
+        assert!(find_label(&tree, "also_hidden").is_none());
+        for (label, line_index) in [("visible", 0), ("also_visible", 2)] {
+            let attr = find_label(&tree, label).expect("visible template interpolation");
+            let line = src.lines().nth(line_index).unwrap();
+            let start = line.find(label).unwrap() as u64;
+            assert_eq!(attr["position"], serde_json::json!({
+                "start_line": line_index,
+                "start_col": start,
+                "end_line": line_index,
+                "end_col": start + label.len() as u64
+            }));
+        }
     }
 
     fn find_label<'a>(value: &'a serde_json::Value, label: &str)
