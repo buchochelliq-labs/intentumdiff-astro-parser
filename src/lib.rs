@@ -543,14 +543,47 @@ fn find_raw_text_close(rest: &str, tag: &str) -> Option<usize> {
     None
 }
 
-// HTML comment/tag openers inside an Astro interpolation are JavaScript
-// source, not template markup. Find only '<' outside balanced braced
-// expressions and their quoted strings, preserving original byte offsets.
+// Astro expressions can contain actual JSX elements, e.g.
+// {items.map(item => <p id="inside">{item}</p>)}. A '<' in a JS
+// string/comment/regex or a comparison must not fabricate template markup.
+fn looks_like_nested_jsx_tag(source: &str, at: usize) -> bool {
+    let tail = source[at + 1..].strip_prefix('/').unwrap_or(&source[at + 1..]);
+    if !tail.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_') {
+        return false;
+    }
+    let prefix = source[..at].trim_end();
+    matches!(prefix.chars().last(),
+        None | Some('{' | '(' | '[' | '=' | '>' | ':' | ',' | '?'))
+        || prefix.ends_with("return")
+}
+
+// Find HTML/JSX markup while respecting JavaScript lexical bodies inside
+// Astro interpolations. Offsets are original UTF-8 bytes, not rendered text.
 fn next_html_open(rest: &str) -> Option<usize> {
     let mut braces = 0_usize;
     let mut quote: Option<char> = None;
     let mut escaped = false;
+    let mut block_comment = false;
+    let mut line_comment = false;
+    let mut skip_before_byte = 0_usize;
     for (idx, ch) in rest.char_indices() {
+        if idx < skip_before_byte {
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && rest[idx + 1..].starts_with('/') {
+                block_comment = false;
+                skip_before_byte = idx + 2;
+            }
+            continue;
+        }
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+            } else {
+                continue;
+            }
+        }
         if let Some(active) = quote {
             if escaped {
                 escaped = false;
@@ -561,11 +594,28 @@ fn next_html_open(rest: &str) -> Option<usize> {
             }
             continue;
         }
+        if braces > 0 && ch == '/' {
+            if rest[idx + 1..].starts_with('*') {
+                block_comment = true;
+                skip_before_byte = idx + 2;
+                continue;
+            }
+            if rest[idx + 1..].starts_with('/') {
+                line_comment = true;
+                skip_before_byte = idx + 2;
+                continue;
+            }
+            if let Some(end) = js_regex_literal_end(rest, idx) {
+                skip_before_byte = end;
+                continue;
+            }
+        }
         if braces > 0 {
             match ch {
                 '{' => braces += 1,
                 '}' => braces -= 1,
                 '"' | '\'' | '`' => quote = Some(ch),
+                '<' if looks_like_nested_jsx_tag(rest, idx) => return Some(idx),
                 _ => {}
             }
             continue;
@@ -1044,6 +1094,45 @@ mod tests {
             };
             assert!(find_label(&tree, expected).is_some(),
                 "source attribute must survive the operator");
+        }
+    }
+
+    #[test]
+    fn nested_jsx_markup_inside_interpolation_retains_its_attributes() {
+        let source = "{items.map(item => <p id=\"inside\">{item}</p>)}<p id=\"after\"/>";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(source, "Page.astro")).unwrap();
+        for (label, raw) in [
+            ("id=inside", "id=\"inside\""),
+            ("id=after", "id=\"after\""),
+        ] {
+            let attr = find_label(&tree, label)
+                .unwrap_or_else(|| panic!("missing nested JSX attribute {label}"));
+            let start = source.find(raw).unwrap() as u64;
+            assert_eq!(attr["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
+        }
+    }
+
+    #[test]
+    fn js_comments_and_regex_braces_do_not_hide_following_template_elements() {
+        for source in [
+            "<p>{/* don't remove */ value}</p><p id=\"after\"/>",
+            "<p>{/{/.test(value)}</p><p id=\"after\"/>",
+            "<p>{\"<!--\"}</p><p id=\"after\"/>",
+        ] {
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(source, "Page.astro")).unwrap();
+            let later = find_label(&tree, "id=after")
+                .expect("JS lexical body must not consume following template markup");
+            let raw = "id=\"after\"";
+            let start = source.find(raw).unwrap() as u64;
+            assert_eq!(later["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
         }
     }
 
