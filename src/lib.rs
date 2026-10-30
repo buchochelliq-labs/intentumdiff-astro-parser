@@ -293,7 +293,7 @@ fn attribute_token_ranges(attrs: &str) -> Vec<(usize, usize)> {
             continue;
         }
         match ch {
-            '"' | '\'' => quote = Some(ch),
+            '"' | '\'' | '`' => quote = Some(ch),
             '{' => braces += 1,
             '}' if braces > 0 => braces -= 1,
             _ => {}
@@ -395,7 +395,7 @@ fn find_tag_close(after_open: &str) -> Option<usize> {
             continue;
         }
         match ch {
-            '"' | '\'' => quote = Some(ch),
+            '"' | '\'' | '`' => quote = Some(ch),
             '{' => braces += 1,
             '}' if braces > 0 => braces -= 1,
             '>' if braces == 0 => return Some(idx),
@@ -407,11 +407,28 @@ fn find_tag_close(after_open: &str) -> Option<usize> {
 
 fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) -> Vec<SemanticNode> {
     let mut children = Vec::new();
+    let mut in_html_comment = false;
     for (line_idx, line) in content.lines().enumerate() {
         let absolute_line = start_line + line_idx as u32;
         let mut rest = line;
-        while let Some(open_idx) = rest.find('<') {
+        loop {
+            // HTML comments are not tags. Skip their body before quote/brace
+            // tracking, even when a comment spans lines or contains "<" and "'".
+            if in_html_comment {
+                if let Some(end) = rest.find("-->") {
+                    rest = &rest[end + 3..];
+                    in_html_comment = false;
+                } else {
+                    break;
+                }
+            }
+            let Some(open_idx) = rest.find('<') else { break };
             let after_open = &rest[open_idx + 1..];
+            if after_open.starts_with("!--") {
+                in_html_comment = true;
+                rest = &after_open[3..];
+                continue;
+            }
             if let Some(close_idx) = find_tag_close(after_open) {
                 let segment = &after_open[..close_idx];
                 if let Some((tag, attrs)) = parse_tag_segment(segment) {
@@ -789,6 +806,57 @@ mod tests {
                 serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
             assert!(tree.is_object());
         }
+    }
+
+
+    #[test]
+    fn jsx_backtick_literals_do_not_swallow_later_elements() {
+        let src = "<div title={`it's fine`}></div><p id=\"after\"/>";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        for (label, raw) in [
+            ("title=`it's fine`", "title={`it's fine`}"),
+            ("id=after", "id=\"after\""),
+        ] {
+            let attr = find_label(&tree, label)
+                .unwrap_or_else(|| panic!("missing template attribute: {label}"));
+            let start = src.find(raw).unwrap() as u64;
+            assert_eq!(attr["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
+        }
+    }
+
+    #[test]
+    fn html_comments_do_not_consume_subsequent_tag_attributes() {
+        let src = "<!-- don't remove <x> --><p id=\"after\"/>";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        let attr = find_label(&tree, "id=after").expect("paragraph after comment");
+        let raw = "id=\"after\"";
+        let start = src.find(raw).unwrap() as u64;
+        assert_eq!(attr["position"], serde_json::json!({
+            "start_line": 0, "start_col": start,
+            "end_line": 0, "end_col": start + raw.len() as u64
+        }));
+        assert!(find_label(&tree, "x").is_none(),
+            "HTML comment tags must not become semantic elements");
+    }
+
+    #[test]
+    fn multiline_comments_do_not_swallow_later_lines() {
+        let src = "<!-- don't parse\n<x title='wrong'>\n--> <p id='kept' />";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        assert!(find_label(&tree, "title=wrong").is_none());
+        let attr = find_label(&tree, "id=kept").expect("valid tag following comment");
+        let last_line = src.lines().nth(2).unwrap();
+        let start = last_line.find("id='kept'").unwrap() as u64;
+        assert_eq!(attr["position"], serde_json::json!({
+            "start_line": 2, "start_col": start,
+            "end_line": 2, "end_col": start + "id='kept'".len() as u64
+        }));
     }
 
     fn find_label<'a>(value: &'a serde_json::Value, label: &str)
