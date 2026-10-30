@@ -271,8 +271,27 @@ fn attribute_token_ranges(attrs: &str) -> Vec<(usize, usize)> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut braces = 0_usize;
+    let mut js_block_comment = false;
+    let mut js_line_comment = false;
+    let mut skip_before_byte = 0_usize;
 
     for (idx, ch) in attrs.char_indices() {
+        if idx < skip_before_byte {
+            continue;
+        }
+        if js_block_comment {
+            if ch == '*' && attrs[idx + 1..].starts_with('/') {
+                js_block_comment = false;
+                skip_before_byte = idx + 2;
+            }
+            continue;
+        }
+        if js_line_comment {
+            if ch != '\n' {
+                continue;
+            }
+            js_line_comment = false;
+        }
         if ch.is_whitespace() && quote.is_none() && braces == 0 {
             if let Some(begin) = start.take() {
                 ranges.push((begin, idx));
@@ -293,6 +312,20 @@ fn attribute_token_ranges(attrs: &str) -> Vec<(usize, usize)> {
                 quote = None;
             }
             continue;
+        }
+        // JS comments inside braced expressions must not change quote or
+        // brace depth. The two lexical scanners use the same boundary rule.
+        if braces > 0 && ch == '/' {
+            if attrs[idx + 1..].starts_with('*') {
+                js_block_comment = true;
+                skip_before_byte = idx + 2;
+                continue;
+            }
+            if attrs[idx + 1..].starts_with('/') {
+                js_line_comment = true;
+                skip_before_byte = idx + 2;
+                continue;
+            }
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
@@ -386,7 +419,26 @@ fn find_tag_close(after_open: &str) -> Option<usize> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut braces = 0_usize;
+    let mut js_block_comment = false;
+    let mut js_line_comment = false;
+    let mut skip_before_byte = 0_usize;
     for (idx, ch) in after_open.char_indices() {
+        if idx < skip_before_byte {
+            continue;
+        }
+        if js_block_comment {
+            if ch == '*' && after_open[idx + 1..].starts_with('/') {
+                js_block_comment = false;
+                skip_before_byte = idx + 2;
+            }
+            continue;
+        }
+        if js_line_comment {
+            if ch != '\n' {
+                continue;
+            }
+            js_line_comment = false;
+        }
         if let Some(active_quote) = quote {
             // HTML quoted attributes use literal backslashes. Only JS strings
             // inside braced Astro/JSX expressions have backslash escaping.
@@ -398,6 +450,20 @@ fn find_tag_close(after_open: &str) -> Option<usize> {
                 quote = None;
             }
             continue;
+        }
+        // JS comments inside braced expressions must not change quote or
+        // brace depth. The two lexical scanners use the same boundary rule.
+        if braces > 0 && ch == '/' {
+            if after_open[idx + 1..].starts_with('*') {
+                js_block_comment = true;
+                skip_before_byte = idx + 2;
+                continue;
+            }
+            if after_open[idx + 1..].starts_with('/') {
+                js_line_comment = true;
+                skip_before_byte = idx + 2;
+                continue;
+            }
         }
         match ch {
             '"' | '\'' => quote = Some(ch),
@@ -505,9 +571,16 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                             )
                         })
                         .collect();
-                    let is_raw_text = (tag == "script" || tag == "style")
+                    // Native HTML raw-text tags are lowercase. Astro imports
+                    // such as <Script> and <Style> are components with slots;
+                    // their original source case must survive classification.
+                    let source_tag = segment.trim_start()
+                        .split(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+                        .next()
+                        .unwrap_or("");
+                    let is_raw_text = matches!(source_tag, "script" | "style")
                         && !segment.trim_end().ends_with('/');
-                    let raw_name = if is_raw_text { Some(tag.clone()) } else { None };
+                    let raw_name = if is_raw_text { Some(source_tag.to_string()) } else { None };
                     children.push(
                         SemanticNodeBuilder::new(
                             &child_id, "element", tag,
@@ -987,6 +1060,71 @@ mod tests {
                 "start_col": start,
                 "end_line": line_index,
                 "end_col": start + label.len() as u64
+            }));
+        }
+    }
+
+    #[test]
+    fn capitalized_astro_components_keep_slot_tags_and_interpolations() {
+        for tag in ["Script", "Style"] {
+            let src = format!(
+                "<{tag}><p id=\"inside\">{{value}}</p></{tag}><p id=\"after\"/>"
+            );
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(&src, "Page.astro")).unwrap();
+            for (label, raw) in [
+                ("id=inside", "id=\"inside\""),
+                ("value", "value"),
+                ("id=after", "id=\"after\""),
+            ] {
+                let node = find_label(&tree, label)
+                    .unwrap_or_else(|| panic!("component {tag} suppressed {label}"));
+                let at = src.find(raw).unwrap() as u64;
+                assert_eq!(node["position"], serde_json::json!({
+                    "start_line": 0, "start_col": at,
+                    "end_line": 0, "end_col": at + raw.len() as u64
+                }), "component {tag}, node {label}");
+            }
+        }
+        // Lowercase native tags still suppress raw-text interpolation
+        // instead of inventing template nodes out of JavaScript/CSS.
+        for tag in ["script", "style"] {
+            let src = format!(
+                "<{tag}>const marker = \"{{not_an_interpolation}}\";</{tag}><p id=\"after\"/>"
+            );
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(&src, "Page.astro")).unwrap();
+            assert!(find_label(&tree, "not_an_interpolation").is_none());
+            assert!(find_label(&tree, "id=after").is_some());
+        }
+    }
+
+    #[test]
+    fn jsx_attribute_comments_do_not_swallow_later_elements_or_spans() {
+        for src in [
+            "<div title={/* don't remove */ value}></div><p id=\"after\"/>",
+            "<div title={/* don't } > parse */ value}></div><p id=\"after\"/>",
+            "<div title={/* café ' } > */ value}></div><p id=\"after\"/>",
+        ] {
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+            let attr = find_label(&tree, "id=after")
+                .expect("a JS comment must not swallow following HTML tags");
+            let raw = "id=\"after\"";
+            let at = src.find(raw).unwrap() as u64;
+            assert_eq!(attr["position"], serde_json::json!({
+                "start_line": 0, "start_col": at,
+                "end_line": 0, "end_col": at + raw.len() as u64
+            }));
+            let first_attr = find_label(&tree, "title=/* don't remove */ value")
+                .or_else(|| find_label(&tree, "title=/* don't } > parse */ value"))
+                .or_else(|| find_label(&tree, "title=/* café ' } > */ value"))
+                .expect("JS attribute containing comment should survive");
+            let start = src.find("title={").unwrap() as u64;
+            let end = src.find("}></div>").unwrap() as u64 + 1;
+            assert_eq!(first_attr["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": end
             }));
         }
     }
