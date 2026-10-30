@@ -349,11 +349,16 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                 if let Some((tag, attrs)) = parse_tag_segment(segment) {
                     // Account for already-consumed tags and UTF-8 prefixes.
                     let segment_offset = line.len() - rest.len() + open_idx + 1;
-                    let tag_end = segment
+                    // parse_tag_segment trims leading whitespace; retain its
+                    // original UTF-8 byte offset before locating attributes.
+                    let segment_prefix = segment.len() - segment.trim_start().len();
+                    let trimmed_segment = &segment[segment_prefix..];
+                    let tag_end = trimmed_segment
                         .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-                        .unwrap_or(segment.len());
-                    let raw_attrs = &segment[tag_end..];
-                    let attrs_offset = tag_end + raw_attrs.len() - raw_attrs.trim_start().len();
+                        .unwrap_or(trimmed_segment.len());
+                    let raw_attrs = &trimmed_segment[tag_end..];
+                    let attrs_offset = segment_prefix + tag_end
+                        + raw_attrs.len() - raw_attrs.trim_start().len();
                     let child_id = format!("{}.{}", id_prefix, children.len());
                     let attr_children: Vec<SemanticNode> = parse_attr_labels(&attrs)
                         .into_iter()
@@ -650,6 +655,21 @@ mod tests {
                 "end_line": 0, "end_col": start + raw.len() as u64
             }));
         }
+    }
+
+    #[test]
+    fn attribute_spans_preserve_whitespace_before_tag_names() {
+        let src = "<  meta charset=\"UTF-8\" />";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        let child = find_label(&tree, "charset=UTF-8")
+            .expect("attribute visible after leading tag whitespace");
+        let raw = "charset=\"UTF-8\"";
+        let start = src.find(raw).unwrap() as u64;
+        assert_eq!(child["position"], serde_json::json!({
+            "start_line": 0, "start_col": start,
+            "end_line": 0, "end_col": start + raw.len() as u64
+        }));
     }
 
     fn find_label<'a>(value: &'a serde_json::Value, label: &str)
