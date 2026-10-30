@@ -165,8 +165,13 @@ fn parse_astro(source: &str) -> ParsedAstro {
     }
 }
 
-fn make_leaf(id: &str, node_type: &str, label: impl Into<String>, line: u32) -> SemanticNode {
-    SemanticNodeBuilder::new(id, node_type, label.into(), line, 0, line, 0, "").build()
+fn make_leaf(
+    id: &str, node_type: &str, label: impl Into<String>, line: u32,
+    start_col: u32, end_col: u32,
+) -> SemanticNode {
+    SemanticNodeBuilder::new(
+        id, node_type, label.into(), line, start_col, line, end_col, "",
+    ).build()
 }
 
 fn is_identifier_like(value: &str) -> bool {
@@ -213,33 +218,38 @@ fn extract_frontmatter_children(
             continue;
         }
         let absolute_line = start_line + line_idx as u32;
+        // Semantic labels may be trimmed, but the span stays in ORIGINAL
+        // source byte columns, including any indentation.
+        let indentation = raw_line.len() - raw_line.trim_start().len();
         let child_id = format!("{}.{}", id_prefix, children.len());
         let node = if line.starts_with("import ") {
             Some(make_leaf(
-                &child_id,
-                "import_statement",
-                line,
-                absolute_line,
+                &child_id, "import_statement", line.clone(), absolute_line,
+                indentation as u32, (indentation + line.len()) as u32,
             ))
         } else {
             declaration_name(&line).map(|name| {
+                let keyword_bytes = if line.starts_with("const ") {
+                    "const ".len()
+                } else if line.starts_with("let ") {
+                    "let ".len()
+                } else {
+                    "var ".len()
+                };
+                let name_start = indentation + keyword_bytes;
                 let mut decl = make_leaf(
-                    &child_id,
-                    "variable_declaration",
-                    name.to_string(),
-                    absolute_line,
+                    &child_id, "variable_declaration", name.to_string(), absolute_line,
+                    name_start as u32, (name_start + name.len()) as u32,
                 );
-                // #46: the declaration's RHS is review content — carry it as a child so a
-                // frontmatter value edit (const title = "My Site" -> "...X") surfaces
-                // instead of hashing name-only.
-                if let Some((_, rhs)) = line.split_once('=') {
-                    let rhs = rhs.trim().trim_end_matches(';').trim();
+                if let Some((lhs, rhs_raw)) = line.split_once('=') {
+                    let rhs = rhs_raw.trim().trim_end_matches(';').trim();
                     if !rhs.is_empty() {
+                        let rhs_start = indentation + lhs.len() + 1
+                            + (rhs_raw.len() - rhs_raw.trim_start().len());
                         decl.children = vec![make_leaf(
-                            &format!("{child_id}.0"),
-                            "declaration_value",
-                            rhs.to_string(),
-                            absolute_line,
+                            &format!("{child_id}.0"), "declaration_value", rhs.to_string(),
+                            absolute_line, rhs_start as u32,
+                            (rhs_start + rhs.len()) as u32,
                         )];
                     }
                 }
@@ -253,15 +263,15 @@ fn extract_frontmatter_children(
     children
 }
 
-fn parse_attr_labels(attrs: &str) -> Vec<String> {
+fn parse_attr_labels(attrs: &str) -> Vec<(String, usize, usize)> {
+    // Offsets are relative to the original attribute source (UTF-8 bytes).
+    let mut cursor = 0;
     attrs
         .split_whitespace()
         .filter_map(|part| {
-            let clean = part
-                .trim()
-                .trim_end_matches('>')
-                .trim_end_matches('/')
-                .trim();
+            let token_start = cursor + attrs[cursor..].find(part)?;
+            cursor = token_start + part.len();
+            let clean = part.trim().trim_end_matches('>').trim_end_matches('/').trim();
             if clean.is_empty() {
                 return None;
             }
@@ -270,17 +280,14 @@ fn parse_attr_labels(attrs: &str) -> Vec<String> {
             if name.is_empty() {
                 return None;
             }
-            if value.is_empty() {
-                Some(name.to_string())
+            let label = if value.is_empty() {
+                name.to_string()
             } else {
-                let value = value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .trim_matches('{')
-                    .trim_matches('}');
-                Some(format!("{}={}", name, value))
-            }
+                let value = value.trim().trim_matches('"').trim_matches('\'')
+                    .trim_matches('{').trim_matches('}');
+                format!("{}={}", name, value)
+            };
+            Some((label, token_start, cursor))
         })
         .collect()
 }
@@ -305,21 +312,24 @@ fn parse_tag_segment(segment: &str) -> Option<(String, String)> {
     Some((tag.to_lowercase(), attrs))
 }
 
-fn extract_brace_labels(line: &str) -> Vec<String> {
+fn extract_brace_labels(line: &str) -> Vec<(String, usize, usize)> {
     let mut labels = Vec::new();
-    let mut rest = line;
-    while let Some(start) = rest.find('{') {
-        if rest[start..].starts_with("{{") {
-            rest = &rest[start + 2..];
+    let mut cursor = 0;
+    while let Some(relative_start) = line[cursor..].find('{') {
+        let opening = cursor + relative_start;
+        if line[opening..].starts_with("{{") {
+            cursor = opening + 2;
             continue;
         }
-        let after = &rest[start + 1..];
+        let after = &line[opening + 1..];
         if let Some(end) = after.find('}') {
-            let label = after[..end].trim();
+            let raw_label = &after[..end];
+            let label = raw_label.trim();
             if !label.is_empty() && !label.starts_with('#') && !label.starts_with('/') {
-                labels.push(label.to_string());
+                let start = opening + 1 + raw_label.len() - raw_label.trim_start().len();
+                labels.push((label.to_string(), start, start + label.len()));
             }
-            rest = &after[end + 1..];
+            cursor = opening + 1 + end + 1;
         } else {
             break;
         }
@@ -337,28 +347,31 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
             if let Some(close_idx) = after_open.find('>') {
                 let segment = &after_open[..close_idx];
                 if let Some((tag, attrs)) = parse_tag_segment(segment) {
+                    // Account for already-consumed tags and UTF-8 prefixes.
+                    let segment_offset = line.len() - rest.len() + open_idx + 1;
+                    let tag_end = segment
+                        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                        .unwrap_or(segment.len());
+                    let raw_attrs = &segment[tag_end..];
+                    let attrs_offset = tag_end + raw_attrs.len() - raw_attrs.trim_start().len();
                     let child_id = format!("{}.{}", id_prefix, children.len());
                     let attr_children: Vec<SemanticNode> = parse_attr_labels(&attrs)
                         .into_iter()
                         .enumerate()
-                        .map(|(i, label)| {
+                        .map(|(i, (label, start, end))| {
                             make_leaf(
-                                &format!("{}.{}", child_id, i),
-                                "attribute",
-                                label,
+                                &format!("{}.{}", child_id, i), "attribute", label,
                                 absolute_line,
+                                (segment_offset + attrs_offset + start) as u32,
+                                (segment_offset + attrs_offset + end) as u32,
                             )
                         })
                         .collect();
                     children.push(
                         SemanticNodeBuilder::new(
-                            &child_id,
-                            "element",
-                            tag,
-                            absolute_line,
-                            0,
-                            absolute_line,
-                            0,
+                            &child_id, "element", tag,
+                            absolute_line, (segment_offset - 1) as u32,
+                            absolute_line, (segment_offset + close_idx + 1) as u32,
                             "",
                         )
                         .children(attr_children)
@@ -370,9 +383,12 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                 break;
             }
         }
-        for label in extract_brace_labels(line) {
+        for (label, start, end) in extract_brace_labels(line) {
             let child_id = format!("{}.{}", id_prefix, children.len());
-            children.push(make_leaf(&child_id, "interpolation", label, absolute_line));
+            children.push(make_leaf(
+                &child_id, "interpolation", label, absolute_line,
+                start as u32, end as u32,
+            ));
         }
     }
     children
@@ -577,6 +593,73 @@ mod tests {
         assert!(labels.iter().any(|label| label == "meta"));
         assert!(labels.iter().any(|label| label == "header"));
         assert!(labels.iter().any(|label| label == "main"));
+    }
+
+    #[test]
+    fn source_spans_anchor_charset_edits_and_frontmatter_values() {
+        let old = "---\nconst title = \"My Site\";\n---\n<html><meta charset=\"UTF-8\" /></html>\n";
+        let changed_charset = old.replace("UTF-8", "UTF-9");
+        let changed_title = old.replace("My Site", "My SiteX");
+        for src in [old, changed_charset.as_str(), changed_title.as_str()] {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+            let attribute_label = if src.contains("UTF-9") {
+                "charset=UTF-9"
+            } else {
+                "charset=UTF-8"
+            };
+            let attr = find_label(&parsed, attribute_label).expect("attribute visible");
+            let line = src.lines().nth(3).unwrap();
+            let raw_attr = if src.contains("UTF-9") {
+                "charset=\"UTF-9\""
+            } else {
+                "charset=\"UTF-8\""
+            };
+            let attr_start = line.find(raw_attr).unwrap() as u64;
+            assert_eq!(attr["position"], serde_json::json!({
+                "start_line": 3, "start_col": attr_start,
+                "end_line": 3, "end_col": attr_start + raw_attr.len() as u64
+            }));
+            let rhs = if src.contains("My SiteX") {
+                "\"My SiteX\""
+            } else {
+                "\"My Site\""
+            };
+            let value = find_label(&parsed, rhs).expect("frontmatter RHS visible");
+            let rhs_start = src.lines().nth(1).unwrap().find(rhs).unwrap() as u64;
+            assert_eq!(value["position"], serde_json::json!({
+                "start_line": 1, "start_col": rhs_start,
+                "end_line": 1, "end_col": rhs_start + rhs.len() as u64
+            }));
+        }
+    }
+
+    #[test]
+    fn attribute_spans_account_for_inline_tags_and_utf8_prefixes() {
+        let src = "<p title=\"café\"></p><meta charset=\"UTF-8\" />";
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+        for (label, raw) in [
+            ("title=café", "title=\"café\""),
+            ("charset=UTF-8", "charset=\"UTF-8\""),
+        ] {
+            let child = find_label(&tree, label).expect("semantic attribute missing");
+            let start = src.find(raw).unwrap() as u64;
+            assert_eq!(child["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
+        }
+    }
+
+    fn find_label<'a>(value: &'a serde_json::Value, label: &str)
+        -> Option<&'a serde_json::Value>
+    {
+        if value.get("label").and_then(|v| v.as_str()) == Some(label) {
+            return Some(value);
+        }
+        value.get("children").and_then(|c| c.as_array())
+            .and_then(|children| children.iter().find_map(|child| find_label(child, label)))
     }
 
     fn collect_labels(value: &serde_json::Value) -> Vec<String> {
