@@ -271,7 +271,14 @@ fn extract_frontmatter_children(
 // This is intentionally restricted to expression-start/operator contexts;
 // ordinary HTML quoted values are never interpreted as JavaScript.
 fn js_regex_literal_end(source: &str, slash: usize) -> Option<usize> {
-    let previous = source[..slash].chars().rev().find(|c| !c.is_whitespace());
+    let prefix = source[..slash].trim_end();
+    let previous = prefix.chars().last();
+    // A slash after postfix ++/-- is division, not a regex opener. Both
+    // attribute scanners share this classifier; treating it as regex can
+    // consume a later closing tag and silently drop subsequent elements.
+    if prefix.ends_with("++") || prefix.ends_with("--") {
+        return None;
+    }
     if !matches!(previous, Some('{' | '(' | '[' | '=' | ':' | ',' | '?' | '!' | '&' | '|' | '+' | '-' | '*' | '%' | '^' | '~')) {
         return None;
     }
@@ -1013,6 +1020,32 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn postfix_increment_and_decrement_are_division_not_regex_in_attributes() {
+        for source in [
+            "<div title={value++ / divisor}></div><p id=\"after\"/>",
+            "<div title={value-- / divisor}></div><p id=\"after\"/>",
+        ] {
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(source, "Page.astro")).unwrap();
+            let later = find_label(&tree, "id=after")
+                .expect("postfix operator must not swallow closing tag or next element");
+            let raw = "id=\"after\"";
+            let start = source.find(raw).unwrap() as u64;
+            assert_eq!(later["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + raw.len() as u64
+            }));
+            let expected = if source.contains("++") {
+                "title=value++ / divisor"
+            } else {
+                "title=value-- / divisor"
+            };
+            assert!(find_label(&tree, expected).is_some(),
+                "source attribute must survive the operator");
+        }
+    }
 
     #[test]
     fn jsx_backtick_literals_do_not_swallow_later_elements() {
