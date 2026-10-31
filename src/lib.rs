@@ -504,7 +504,9 @@ fn extract_brace_labels(line: &str) -> Vec<(String, usize, usize)> {
         if let Some(close) = balanced_interpolation_end(line, opening) {
             let raw_label = &line[opening + 1..close];
             let label = raw_label.trim();
-            if !label.is_empty() && !label.starts_with('#') && !label.starts_with('/') {
+            // Leading /* comments and /regex/ are valid JS expression evidence.
+            // They must not be discarded as template-control closers.
+            if !label.is_empty() && !label.starts_with('#') {
                 let start = opening + 1 + raw_label.len() - raw_label.trim_start().len();
                 labels.push((label.to_string(), start, start + label.len()));
             }
