@@ -430,6 +430,68 @@ fn parse_tag_segment(segment: &str) -> Option<(String, String)> {
     Some((tag.to_lowercase(), attrs))
 }
 
+// Return a source-byte position only for the matching expression brace.
+// Treat JS strings, block/line comments and regex character classes as
+// lexical bodies: a '}' in one is not the end of an Astro interpolation.
+fn balanced_interpolation_end(line: &str, opening: usize) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    let mut skip_before_byte = 0_usize;
+
+    for (relative, ch) in line[opening + 1..].char_indices() {
+        let at = opening + 1 + relative;
+        if at < skip_before_byte {
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && line[at + 1..].starts_with('/') {
+                block_comment = false;
+                skip_before_byte = at + 2;
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '/' {
+            if line[at + 1..].starts_with('*') {
+                block_comment = true;
+                skip_before_byte = at + 2;
+                continue;
+            }
+            if line[at + 1..].starts_with('/') {
+                // Line comment: the closing brace cannot be on this line.
+                return None;
+            }
+            if let Some(end) = js_regex_literal_end(line, at) {
+                skip_before_byte = end;
+                continue;
+            }
+        }
+        match ch {
+            '"' | '\'' | '\u{60}' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn extract_brace_labels(line: &str) -> Vec<(String, usize, usize)> {
     let mut labels = Vec::new();
     let mut cursor = 0;
@@ -439,22 +501,20 @@ fn extract_brace_labels(line: &str) -> Vec<(String, usize, usize)> {
             cursor = opening + 2;
             continue;
         }
-        let after = &line[opening + 1..];
-        if let Some(end) = after.find('}') {
-            let raw_label = &after[..end];
+        if let Some(close) = balanced_interpolation_end(line, opening) {
+            let raw_label = &line[opening + 1..close];
             let label = raw_label.trim();
             if !label.is_empty() && !label.starts_with('#') && !label.starts_with('/') {
                 let start = opening + 1 + raw_label.len() - raw_label.trim_start().len();
                 labels.push((label.to_string(), start, start + label.len()));
             }
-            cursor = opening + 1 + end + 1;
+            cursor = close + 1;
         } else {
             break;
         }
     }
     labels
 }
-
 
  // '>' ends a tag only outside quoted/JSX attribute values. All offsets are
  // byte offsets from char_indices so multibyte UTF-8 prefixes stay anchored.
@@ -1376,6 +1436,36 @@ mod tests {
                 "start_line": 0, "start_col": at,
                 "end_line": 0, "end_col": at + r#"id="after""#.len() as u64
             }), "{src}");
+        }
+    }
+
+    #[test]
+    fn interpolation_source_spans_balance_js_comments_regex_and_nested_braces() {
+        for (src, expected) in [
+            (
+                "<p>{/* don't } remove */ value}</p><p id=\"after\"/>",
+                "/* don't } remove */ value",
+            ),
+            (
+                "<p>{/[{}]/.test(text) ? {count: 1} : null}</p><p id=\"after\"/>",
+                "/[{}]/.test(text) ? {count: 1} : null",
+            ),
+            (
+                "<p>{\"café }\" + ({v: 1}).v}</p><p id=\"after\"/>",
+                "\"café }\" + ({v: 1}).v",
+            ),
+        ] {
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(src, "Page.astro")).unwrap();
+            let node = find_label(&tree, expected)
+                .unwrap_or_else(|| panic!("missing complete Rust interpolation: {expected}"));
+            let start = src.find(expected).unwrap() as u64;
+            assert_eq!(node["position"], serde_json::json!({
+                "start_line": 0, "start_col": start,
+                "end_line": 0, "end_col": start + expected.len() as u64
+            }), "source span for {src}");
+            assert!(find_label(&tree, "id=after").is_some(),
+                "lexical bodies must not swallow following markup: {src}");
         }
     }
 
