@@ -773,7 +773,7 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
     let mut in_html_comment = false;
     let mut raw_text_tag: Option<String> = None;
     // An opening tag whose `>` is on a later line (multi-line attributes).
-    let mut open_tag_continues = false;
+    let mut pending_tag: Option<PendingTag> = None;
     for (line_idx, line) in content.lines().enumerate() {
         let absolute_line = start_line + line_idx as u32;
         let mut rest = line;
@@ -782,11 +782,28 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
         let mut interpolation_visible = line.as_bytes().to_vec();
         // Byte ranges of tag markup on this line (never static text).
         let mut markup_ranges: Vec<(usize, usize)> = Vec::new();
-        if open_tag_continues {
-            if let Some(close) = find_tag_close(line) {
-                markup_ranges.push((0, close + 1));
-                rest = &line[close + 1..];
-                open_tag_continues = false;
+        if let Some(pending) = &mut pending_tag {
+            // Close the tag on the joined source so quote/brace state carries
+            // across lines; the `>` can only lie on this newly added line.
+            pending.text.push('\n');
+            let line_offset = pending.text.len();
+            pending.text.push_str(line);
+            pending.lines.push((line_offset, absolute_line));
+            if let Some(close) = find_tag_close(&pending.text) {
+                let close_col = close - line_offset;
+                markup_ranges.push((0, close_col + 1));
+                rest = &line[close_col + 1..];
+                let pending = pending_tag.take().expect("pending tag");
+                let at = |offset: usize| pending.position(offset);
+                let child_id = format!("{}.{}", id_prefix, children.len());
+                if let Some((element, raw_name)) = open_tag_element(
+                    &child_id, &pending.text[..close], (pending.lines[0].1, pending.open_col), &at,
+                ) {
+                    children.push(element);
+                    if raw_name.is_some() {
+                        raw_text_tag = raw_name;
+                    }
+                }
             } else {
                 markup_ranges.push((0, line.len()));
                 rest = "";
@@ -841,54 +858,16 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
             }
             if let Some(close_idx) = find_tag_close(after_open) {
                 let segment = &after_open[..close_idx];
-                if let Some((tag, attrs)) = parse_tag_segment(segment) {
-                    // Account for already-consumed tags and UTF-8 prefixes.
-                    let segment_offset = line.len() - rest.len() + open_idx + 1;
-                    // parse_tag_segment trims leading whitespace; retain its
-                    // original UTF-8 byte offset before locating attributes.
-                    let segment_prefix = segment.len() - segment.trim_start().len();
-                    let trimmed_segment = &segment[segment_prefix..];
-                    let tag_end = trimmed_segment
-                        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-                        .unwrap_or(trimmed_segment.len());
-                    let raw_attrs = &trimmed_segment[tag_end..];
-                    let attrs_offset = segment_prefix + tag_end
-                        + raw_attrs.len() - raw_attrs.trim_start().len();
-                    let child_id = format!("{}.{}", id_prefix, children.len());
-                    let attr_children: Vec<SemanticNode> = parse_attr_labels(&attrs)
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, (label, start, end))| {
-                            make_leaf(
-                                &format!("{}.{}", child_id, i), "attribute", label,
-                                absolute_line,
-                                (segment_offset + attrs_offset + start) as u32,
-                                (segment_offset + attrs_offset + end) as u32,
-                            )
-                        })
-                        .collect();
-                    // Native HTML raw-text tags are lowercase. Astro imports
-                    // such as <Script> and <Style> are components with slots;
-                    // their original source case must survive classification.
-                    let source_tag = segment.trim_start()
-                        .split(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
-                        .next()
-                        .unwrap_or("");
-                    let is_raw_text = matches!(source_tag, "script" | "style")
-                        && !segment.trim_end().ends_with('/');
-                    let raw_name = if is_raw_text { Some(source_tag.to_string()) } else { None };
-                    children.push(
-                        SemanticNodeBuilder::new(
-                            &child_id, "element", tag,
-                            absolute_line, (segment_offset - 1) as u32,
-                            absolute_line, (segment_offset + close_idx + 1) as u32,
-                            "",
-                        )
-                        .children(attr_children)
-                        .build(),
-                    );
-                    if let Some(raw_name) = raw_name {
-                        raw_text_tag = Some(raw_name);
+                // Account for already-consumed tags and UTF-8 prefixes.
+                let segment_offset = line.len() - rest.len() + open_idx + 1;
+                let at = |offset: usize| (absolute_line, (segment_offset + offset) as u32);
+                let child_id = format!("{}.{}", id_prefix, children.len());
+                if let Some((element, raw_name)) =
+                    open_tag_element(&child_id, segment, (absolute_line, at(0).1 - 1), &at)
+                {
+                    children.push(element);
+                    if raw_name.is_some() {
+                        raw_text_tag = raw_name;
                     }
                 }
                 markup_ranges.push((open_abs, open_abs + 1 + close_idx + 1));
@@ -899,7 +878,12 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                 // stays text.
                 if after_open.starts_with(|c: char| c.is_ascii_alphabetic()) {
                     markup_ranges.push((open_abs, line.len()));
-                    open_tag_continues = true;
+                    pending_tag = Some(PendingTag {
+                        text: after_open.to_string(),
+                        lines: vec![(0, absolute_line)],
+                        first_col: open_abs + 1,
+                        open_col: open_abs as u32,
+                    });
                 }
                 break;
             }
@@ -922,6 +906,73 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
         }
     }
     children
+}
+
+/// An opening tag whose closing `>` has not been seen yet: the source after
+/// its `<`, joined with `\n` across lines, and where each line starts in it.
+struct PendingTag {
+    text: String,
+    /// (byte offset in `text`, absolute source line) per joined line.
+    lines: Vec<(usize, u32)>,
+    /// Source column of `text[0]` on the first line.
+    first_col: usize,
+    open_col: u32,
+}
+
+impl PendingTag {
+    /// Source (line, UTF-8 byte column) of a byte offset in `text`.
+    fn position(&self, offset: usize) -> (u32, u32) {
+        let idx = self.lines.partition_point(|&(start, _)| start <= offset) - 1;
+        let (start, line) = self.lines[idx];
+        let base = if idx == 0 { self.first_col } else { 0 };
+        (line, (base + offset - start) as u32)
+    }
+}
+
+/// The element node for one opening tag. `segment` is the source between `<`
+/// and `>`; `at` maps a byte offset in it to its source (line, column). Also
+/// returns the raw-text tag name when the tag opens `<script>`/`<style>` source.
+fn open_tag_element(
+    child_id: &str,
+    segment: &str,
+    open: (u32, u32),
+    at: &dyn Fn(usize) -> (u32, u32),
+) -> Option<(SemanticNode, Option<String>)> {
+    let (tag, attrs) = parse_tag_segment(segment)?;
+    // parse_tag_segment trims leading whitespace; retain its
+    // original UTF-8 byte offset before locating attributes.
+    let segment_prefix = segment.len() - segment.trim_start().len();
+    let trimmed_segment = &segment[segment_prefix..];
+    let tag_end = trimmed_segment
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(trimmed_segment.len());
+    let raw_attrs = &trimmed_segment[tag_end..];
+    let attrs_offset = segment_prefix + tag_end + raw_attrs.len() - raw_attrs.trim_start().len();
+    let attr_children: Vec<SemanticNode> = parse_attr_labels(&attrs)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (label, start, end))| {
+            let (start_line, start_col) = at(attrs_offset + start);
+            let (end_line, end_col) = at(attrs_offset + end);
+            SemanticNodeBuilder::new(
+                format!("{}.{}", child_id, i), "attribute", label,
+                start_line, start_col, end_line, end_col, "",
+            )
+            .build()
+        })
+        .collect();
+    // Native HTML raw-text tags are lowercase. Astro imports
+    // such as <Script> and <Style> are components with slots;
+    // their original source case must survive classification.
+    let source_tag = trimmed_segment[..tag_end].trim();
+    let is_raw_text = matches!(source_tag, "script" | "style") && !segment.trim_end().ends_with('/');
+    let (end_line, close_col) = at(segment.len());
+    let element = SemanticNodeBuilder::new(
+        child_id, "element", tag, open.0, open.1, end_line, close_col + 1, "",
+    )
+    .children(attr_children)
+    .build();
+    Some((element, is_raw_text.then(|| source_tag.to_string())))
 }
 
 // Static template text is emitted HTML content, so it is semantic. Text is
@@ -1806,5 +1857,61 @@ mod tests {
             }
         }
         labels
+    }
+
+
+    /// (node_type, label) of every template node in document order, positions
+    /// dropped: the facts a layout-only edit must leave unchanged.
+    fn facts(src: &str) -> Vec<(String, String)> {
+        fn walk(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+            if let Some(children) = v["children"].as_array() {
+                for child in children {
+                    out.push((
+                        child["node_type"].as_str().unwrap().to_string(),
+                        child["label"].as_str().unwrap().to_string(),
+                    ));
+                    walk(child, out);
+                }
+            }
+        }
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "a.astro")).unwrap();
+        let mut out = Vec::new();
+        walk(&tree["children"][0], &mut out);
+        out
+    }
+
+    /// Structural hashes of the template's facts (the template_body hash
+    /// itself is a raw content hash, so layout always changes it by design).
+    fn tree_hash(src: &str) -> Vec<String> {
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "a.astro")).unwrap();
+        tree["children"][0]["children"].as_array().unwrap().iter()
+            .map(|c| c["structural_hash"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // Issue #19: a multi-line <script>/<style> opening tag still starts raw text.
+    #[test]
+    fn multiline_raw_text_opening_tag_masks_its_body() {
+        for (single, multi) in [
+            ("<script type=\"module\">\nconst secret = \"hidden\";\n</script>\n",
+             "<script\n type=\"module\"\n>\nconst secret = \"hidden\";\n</script>\n"),
+            ("<style lang=\"css\">\np { color: red; }\n</style>\n",
+             "<style\n  lang=\"css\">\np { color: red; }\n</style>\n"),
+        ] {
+            assert!(text_facts(multi).is_empty(), "{multi:?}: {:?}", text_facts(multi));
+            assert_eq!(facts(multi), facts(single), "{multi:?}");
+            assert_eq!(tree_hash(multi), tree_hash(single), "{multi:?}");
+        }
+        // Element and attribute spans stay source-anchored across lines.
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(
+            "<script\n type=\"module\"\n>\nx\n</script>\n", "a.astro")).unwrap();
+        let element = &nodes_of_type(&tree, "element")[0];
+        assert_eq!(element["position"], serde_json::json!({
+            "start_line": 0, "start_col": 0, "end_line": 2, "end_col": 1}));
+        assert_eq!(nodes_of_type(&tree, "attribute")[0]["position"], span(1, 1, 14));
+        // A self-closing multi-line <script ... /> does not open raw text.
+        assert_eq!(text_facts("<script\n src=\"a.js\" />\n<p>shown</p>\n")[0].0, "shown");
     }
 }
