@@ -206,6 +206,78 @@ fn declaration_name(line: &str) -> Option<&str> {
     None
 }
 
+/// Decode a complete JavaScript string literal (`'..'`, `".."`, or a
+/// backtick template without substitutions) and re-emit it in one canonical
+/// double-quoted JSON spelling. Returns `None` for anything that is not
+/// exactly one literal (concatenations, substitutions, legacy octal escapes,
+/// lone surrogates), so such expressions keep their raw source label.
+fn canonical_js_string_literal(expr: &str) -> Option<String> {
+    let quote = expr.chars().next()?;
+    if !matches!(quote, '\'' | '"' | '`') || expr.len() < 2 || !expr.ends_with(quote) {
+        return None;
+    }
+    let body = &expr[1..expr.len() - 1];
+    if quote == '`' && body.contains("${") {
+        return None;
+    }
+    let mut decoded = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == quote || (quote != '`' && (ch == '\n' || ch == '\r')) {
+            return None;
+        }
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let escape = chars.next()?;
+        match escape {
+            'n' => decoded.push('\n'),
+            't' => decoded.push('\t'),
+            'r' => decoded.push('\r'),
+            'b' => decoded.push('\u{8}'),
+            'f' => decoded.push('\u{c}'),
+            'v' => decoded.push('\u{b}'),
+            '0' if !chars.peek().is_some_and(|c| c.is_ascii_digit()) => decoded.push('\0'),
+            '0'..='9' => return None,
+            'x' => {
+                let hex: String = (0..2).filter_map(|_| chars.next()).collect();
+                if hex.len() != 2 {
+                    return None;
+                }
+                decoded.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+            }
+            'u' => {
+                let code = if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut hex = String::new();
+                    loop {
+                        match chars.next()? {
+                            '}' => break,
+                            c => hex.push(c),
+                        }
+                    }
+                    if hex.is_empty() {
+                        return None;
+                    }
+                    u32::from_str_radix(&hex, 16).ok()?
+                } else {
+                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                    if hex.len() != 4 {
+                        return None;
+                    }
+                    u32::from_str_radix(&hex, 16).ok()?
+                };
+                // Surrogates (including split pairs) are left in raw form.
+                decoded.push(char::from_u32(code)?);
+            }
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => {}
+            other => decoded.push(other),
+        }
+    }
+    serde_json::to_string(&decoded).ok()
+}
+
 fn extract_frontmatter_children(
     content: &str,
     start_line: u32,
@@ -246,8 +318,13 @@ fn extract_frontmatter_children(
                     if !rhs.is_empty() {
                         let rhs_start = indentation + lhs.len() + 1
                             + (rhs_raw.len() - rhs_raw.trim_start().len());
+                        // The span stays on the original literal spelling; the
+                        // label carries the decoded string value so that
+                        // 'Ready' and "Ready" are the same semantic fact.
+                        let value_label = canonical_js_string_literal(rhs)
+                            .unwrap_or_else(|| rhs.to_string());
                         decl.children = vec![make_leaf(
-                            &format!("{child_id}.0"), "declaration_value", rhs.to_string(),
+                            &format!("{child_id}.0"), "declaration_value", value_label,
                             absolute_line, rhs_start as u32,
                             (rhs_start + rhs.len()) as u32,
                         )];
@@ -695,12 +772,26 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
     let mut children = Vec::new();
     let mut in_html_comment = false;
     let mut raw_text_tag: Option<String> = None;
+    // An opening tag whose `>` is on a later line (multi-line attributes).
+    let mut open_tag_continues = false;
     for (line_idx, line) in content.lines().enumerate() {
         let absolute_line = start_line + line_idx as u32;
         let mut rest = line;
         // Mask only non-interpolation comment/raw-text bytes, preserving exact
         // UTF-8 byte columns of all remaining source tokens.
         let mut interpolation_visible = line.as_bytes().to_vec();
+        // Byte ranges of tag markup on this line (never static text).
+        let mut markup_ranges: Vec<(usize, usize)> = Vec::new();
+        if open_tag_continues {
+            if let Some(close) = find_tag_close(line) {
+                markup_ranges.push((0, close + 1));
+                rest = &line[close + 1..];
+                open_tag_continues = false;
+            } else {
+                markup_ranges.push((0, line.len()));
+                rest = "";
+            }
+        }
         loop {
             // The contents of <script>/<style> are not HTML markup. In
             // particular, a JS/CSS string containing "<!--" cannot open an
@@ -731,6 +822,16 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
             }
             let Some(open_idx) = next_html_open(rest) else { break };
             let after_open = &rest[open_idx + 1..];
+            let open_abs = line.len() - rest.len() + open_idx;
+            // Markup opens at `<` followed by a tag name, `/` or `!` (leading
+            // whitespace before the name is tolerated, as before); any other
+            // `<` (e.g. `a <= b`) is ordinary text content.
+            if !after_open.trim_start()
+                .starts_with(|c: char| c.is_ascii_alphabetic() || c == '/' || c == '!')
+            {
+                rest = after_open;
+                continue;
+            }
             if after_open.starts_with("!--") {
                 let start = line.len() - rest.len() + open_idx;
                 interpolation_visible[start..start + 4].fill(b' ');
@@ -790,8 +891,16 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                         raw_text_tag = Some(raw_name);
                     }
                 }
+                markup_ranges.push((open_abs, open_abs + 1 + close_idx + 1));
                 rest = &after_open[close_idx + 1..];
             } else {
+                // Only a `<name` directly followed by its name begins an
+                // opening tag that may continue on the next line; `a < b`
+                // stays text.
+                if after_open.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                    markup_ranges.push((open_abs, line.len()));
+                    open_tag_continues = true;
+                }
                 break;
             }
         }
@@ -804,8 +913,76 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                 start as u32, end as u32,
             ));
         }
+        for (label, start, end) in static_text_runs(line, visible, &markup_ranges) {
+            let child_id = format!("{}.{}", id_prefix, children.len());
+            children.push(make_leaf(
+                &child_id, "text", label, absolute_line,
+                start as u32, end as u32,
+            ));
+        }
     }
     children
+}
+
+// Static template text is emitted HTML content, so it is semantic. Text is
+// every byte that is not tag markup, an HTML comment, raw-text script/style
+// source or an `{...}` interpolation. Runs are split at markup boundaries and
+// labelled with HTML-collapsed whitespace; spans are original UTF-8 bytes of
+// the trimmed run.
+fn static_text_runs(
+    line: &str,
+    visible: &str,
+    markup_ranges: &[(usize, usize)],
+) -> Vec<(String, usize, usize)> {
+    let source = line.as_bytes();
+    let mut is_text: Vec<bool> = source
+        .iter()
+        .zip(visible.as_bytes())
+        .map(|(original, shown)| original == shown)
+        .collect();
+    for &(start, end) in markup_ranges {
+        is_text[start..end.min(line.len())].fill(false);
+    }
+    let mut cursor = 0;
+    while let Some(relative) = visible[cursor..].find('{') {
+        let opening = cursor + relative;
+        if !is_text[opening] {
+            cursor = opening + 1;
+            continue;
+        }
+        match balanced_interpolation_end(visible, opening) {
+            Some(close) => {
+                is_text[opening..=close].fill(false);
+                cursor = close + 1;
+            }
+            None => {
+                // Unterminated expression: its remainder is JS, not text.
+                is_text[opening..].fill(false);
+                break;
+            }
+        }
+    }
+    let mut runs = Vec::new();
+    let mut idx = 0;
+    while idx < line.len() {
+        if !is_text[idx] {
+            idx += 1;
+            continue;
+        }
+        let begin = idx;
+        while idx < line.len() && is_text[idx] {
+            idx += 1;
+        }
+        let run = &line[begin..idx];
+        let trimmed = run.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let start = begin + (run.len() - run.trim_start().len());
+        let label = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+        runs.push((label, start, start + trimmed.len()));
+    }
+    runs
 }
 
 fn process_impl(source: &str, filename: &str) -> String {
@@ -1468,6 +1645,143 @@ mod tests {
             }), "source span for {src}");
             assert!(find_label(&tree, "id=after").is_some(),
                 "lexical bodies must not swallow following markup: {src}");
+        }
+    }
+
+    fn nodes_of_type(value: &serde_json::Value, node_type: &str) -> Vec<serde_json::Value> {
+        let mut found = Vec::new();
+        if value["node_type"] == node_type {
+            found.push(value.clone());
+        }
+        if let Some(children) = value["children"].as_array() {
+            for child in children {
+                found.extend(nodes_of_type(child, node_type));
+            }
+        }
+        found
+    }
+
+    fn text_facts(src: &str) -> Vec<(String, serde_json::Value)> {
+        let tree: serde_json::Value =
+            serde_json::from_str(&process_impl(src, "assessment.astro")).unwrap();
+        nodes_of_type(&tree, "text")
+            .into_iter()
+            .map(|n| (n["label"].as_str().unwrap().to_string(), n["position"].clone()))
+            .collect()
+    }
+
+    fn span(line: u64, start: usize, end: usize) -> serde_json::Value {
+        serde_json::json!({
+            "start_line": line, "start_col": start, "end_line": line, "end_col": end
+        })
+    }
+
+    // Issue #17: web-astro-child_text, web-astro-unicode and
+    // web-astro-external-button-text (exact old/new assessment pairs).
+    #[test]
+    fn static_template_text_is_a_semantic_fact_with_source_spans() {
+        for (src, text) in [
+            ("<main><p>Ready</p></main>\n", "Ready"),
+            ("<main><p>Failed</p></main>\n", "Failed"),
+            ("<p>你好，世界</p>\n", "你好，世界"),
+            ("<p>你好，朋友</p>\n", "你好，朋友"),
+            ("<button>Click</button>", "Click"),
+            ("<button>Stop</button>", "Stop"),
+        ] {
+            let start = src.find(text).unwrap();
+            assert_eq!(
+                text_facts(src),
+                vec![(text.to_string(), span(0, start, start + text.len()))],
+                "{src}"
+            );
+        }
+        assert_ne!(
+            process_impl("<p>你好，世界</p>\n", "a.astro"),
+            process_impl("<p>你好，朋友</p>\n", "a.astro")
+        );
+    }
+
+    #[test]
+    fn start_tag_whitespace_and_identity_keep_text_facts_equal() {
+        let labels = |src: &str| -> Vec<String> {
+            text_facts(src).into_iter().map(|(label, _)| label).collect()
+        };
+        assert_eq!(labels("<button>Click</button>"), labels("<button >Click</button>"));
+        assert_eq!(text_facts("<button >Click</button>"), vec![("Click".to_string(), span(0, 9, 14))]);
+        // HTML collapses inter-word whitespace; the label follows that.
+        assert_eq!(labels("<p>Hello   world</p>"), labels("<p>Hello world</p>"));
+    }
+
+    #[test]
+    fn text_excludes_markup_comments_raw_text_and_interpolations() {
+        let src = concat!(
+            "<!-- hidden note -->\n",
+            "<script>const x = \"not text\";</script>\n",
+            "<div\n",
+            "  class=\"multi line\"\n",
+            ">Inside {value} after</div>\n",
+            "Total: {a < b ? 1 : 2} items\n",
+            "a < b"
+        );
+        let labels: Vec<String> = text_facts(src).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(labels, vec!["Inside", "after", "Total:", "items", "a < b"]);
+        let facts = text_facts(src);
+        let line4 = src.lines().nth(4).unwrap();
+        assert_eq!(facts[0].1, span(4, line4.find("Inside").unwrap(), line4.find("Inside").unwrap() + 6));
+        // Interpolation facts are unchanged by text projection.
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(src, "a.astro")).unwrap();
+        assert!(find_label(&tree, "value").is_some());
+        assert!(find_label(&tree, "a < b ? 1 : 2").is_some());
+    }
+
+    // core#272 / web-astro-preservation: equivalent JS quote spellings in
+    // frontmatter decode to the same declaration value.
+    #[test]
+    fn frontmatter_string_literals_compare_by_decoded_value() {
+        let value_of = |src: &str| -> (String, serde_json::Value) {
+            let tree: serde_json::Value =
+                serde_json::from_str(&process_impl(src, "assessment.astro")).unwrap();
+            let node = nodes_of_type(&tree, "declaration_value").remove(0);
+            (node["label"].as_str().unwrap().to_string(), node["position"].clone())
+        };
+        let old = "---\nconst title = 'Ready';\n---\n<h1>{title}</h1>\n";
+        let new = "---\nconst title = \"Ready\";\n---\n<h1>{title}</h1>\n";
+        assert_eq!(value_of(old), ("\"Ready\"".to_string(), span(1, 14, 21)));
+        assert_eq!(value_of(new), ("\"Ready\"".to_string(), span(1, 14, 21)));
+        assert_eq!(value_of("---\nconst t = `Ready`;\n---\n").0, "\"Ready\"");
+        assert_eq!(value_of("---\nconst t = 'it\\'s';\n---\n").0, "\"it's\"");
+        assert_eq!(value_of("---\nconst t = \"it's\";\n---\n").0, "\"it's\"");
+        assert_eq!(value_of("---\nconst t = '\\u0041\\x42\\u{43}';\n---\n").0, "\"ABC\"");
+        // Genuinely different values and escapes stay distinct.
+        assert_ne!(value_of("---\nconst t = 'a\\nb';\n---\n").0,
+                   value_of("---\nconst t = 'anb';\n---\n").0);
+        assert_ne!(value_of(old).0, value_of("---\nconst title = 'Failed';\n---\n").0);
+        // Non-literals keep their source spelling.
+        for raw in ["'a' + 'b'", "`hi ${name}`", "'\\1'", "count + 1"] {
+            let src = format!("---\nconst t = {raw};\n---\n");
+            assert_eq!(value_of(&src).0, raw);
+        }
+    }
+
+    // Exact examples from issues #6 and #10 not already covered verbatim.
+    #[test]
+    fn issue_6_and_10_exact_examples() {
+        for (src, label, raw) in [
+            ("<a title=\"first second\" />", "title=first second", "title=\"first second\""),
+            ("<a title=\"left > right\" />", "title=left > right", "title=\"left > right\""),
+        ] {
+            let tree: serde_json::Value = serde_json::from_str(&process_impl(src, "a.astro")).unwrap();
+            let node = find_label(&tree, label).expect(label);
+            let at = src.find(raw).unwrap();
+            assert_eq!(node["position"], span(0, at, at + raw.len()));
+            assert!(find_label(&tree, "second\"").is_none());
+            assert!(nodes_of_type(&tree, "text").is_empty(), "{src}");
+        }
+        let src = "<Script>\n<p id=\"inside\">{value}</p>\n</Script>\n<p id=\"after\"/>";
+        let tree: serde_json::Value = serde_json::from_str(&process_impl(src, "a.astro")).unwrap();
+        for (label, line) in [("id=inside", 1), ("value", 1), ("id=after", 3)] {
+            let node = find_label(&tree, label).expect(label);
+            assert_eq!(node["position"]["start_line"], line);
         }
     }
 
