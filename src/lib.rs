@@ -774,6 +774,9 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
     let mut raw_text_tag: Option<String> = None;
     // An opening tag whose `>` is on a later line (multi-line attributes).
     let mut pending_tag: Option<PendingTag> = None;
+    // The last emitted text fact if it ran to the end of its line, so a run
+    // continuing at the start of the next line collapses into it (#21).
+    let mut open_text: Option<OpenText> = None;
     // Interpolations of a multi-line opening tag, emitted after its element.
     let mut deferred_interpolations: Vec<(String, u32, usize, usize)> = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
@@ -913,12 +916,29 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                 start as u32, end as u32,
             ));
         }
-        for (label, start, end) in static_text_runs(line, visible, &markup_ranges) {
-            let child_id = format!("{}.{}", id_prefix, children.len());
-            children.push(make_leaf(
-                &child_id, "text", label, absolute_line,
-                start as u32, end as u32,
-            ));
+        let (runs, line_is_blank_text) = static_text_runs(line, visible, &markup_ranges);
+        if runs.is_empty() && !line_is_blank_text {
+            open_text = None;
+        }
+        let run_count = runs.len();
+        for (i, run) in runs.into_iter().enumerate() {
+            let continues = open_text.take().filter(|_| i == 0 && run.at_line_start);
+            let (index, label, start) = match continues {
+                Some(prev) => (prev.index, format!("{} {}", prev.label, run.label), prev.start),
+                None => (children.len(), run.label, (absolute_line, run.start as u32)),
+            };
+            let node = SemanticNodeBuilder::new(
+                format!("{}.{}", id_prefix, index), "text", label.clone(),
+                start.0, start.1, absolute_line, run.end as u32, "",
+            ).build();
+            if index == children.len() {
+                children.push(node);
+            } else {
+                children[index] = node;
+            }
+            if i + 1 == run_count && run.at_line_end {
+                open_text = Some(OpenText { index, label, start });
+            }
         }
     }
     // An opening tag left unterminated at end of input keeps its
@@ -953,6 +973,13 @@ impl PendingTag {
         let base = if idx == 0 { self.first_col } else { 0 };
         (line, (base + offset - start) as u32)
     }
+}
+
+/// A text fact that ran to the end of its source line.
+struct OpenText {
+    index: usize,
+    label: String,
+    start: (u32, u32),
 }
 
 /// The element node for one opening tag. `segment` is the source between `<`
@@ -1010,7 +1037,7 @@ fn static_text_runs(
     line: &str,
     visible: &str,
     markup_ranges: &[(usize, usize)],
-) -> Vec<(String, usize, usize)> {
+) -> (Vec<TextRun>, bool) {
     let source = line.as_bytes();
     let mut is_text: Vec<bool> = source
         .iter()
@@ -1039,6 +1066,7 @@ fn static_text_runs(
             }
         }
     }
+    let blank = is_text.iter().all(|&t| t) && line.trim().is_empty();
     let mut runs = Vec::new();
     let mut idx = 0;
     while idx < line.len() {
@@ -1057,10 +1085,27 @@ fn static_text_runs(
         }
         let start = begin + (run.len() - run.trim_start().len());
         let label = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-        runs.push((label, start, start + trimmed.len()));
+        runs.push(TextRun {
+            label,
+            start,
+            end: start + trimmed.len(),
+            at_line_start: begin == 0,
+            at_line_end: idx == line.len(),
+        });
     }
-    runs
+    (runs, blank)
 }
+
+/// One static text run of a line; `at_line_start`/`at_line_end` say whether
+/// only (whitespace) text separates it from the line's start/end.
+struct TextRun {
+    label: String,
+    start: usize,
+    end: usize,
+    at_line_start: bool,
+    at_line_end: bool,
+}
+
 
 fn process_impl(source: &str, filename: &str) -> String {
     let stem = filename
@@ -1801,7 +1846,8 @@ mod tests {
             "a < b"
         );
         let labels: Vec<String> = text_facts(src).into_iter().map(|(l, _)| l).collect();
-        assert_eq!(labels, vec!["Inside", "after", "Total:", "items", "a < b"]);
+        // HTML collapses the line break between `items` and `a < b` (#21).
+        assert_eq!(labels, vec!["Inside", "after", "Total:", "items a < b"]);
         let facts = text_facts(src);
         let line4 = src.lines().nth(4).unwrap();
         assert_eq!(facts[0].1, span(4, line4.find("Inside").unwrap(), line4.find("Inside").unwrap() + 6));
@@ -1952,5 +1998,24 @@ mod tests {
         assert!(labels.iter().any(|l| l.contains("<span title=\"kept\">")), "{labels:?}");
         assert_ne!(tree_hash(multi), tree_hash(&multi.replace("kept", "gone")));
         assert_eq!(text_facts(multi).into_iter().map(|(l, _)| l).collect::<Vec<_>>(), ["After"]);
+    }
+
+    // Issue #21: HTML whitespace collapsing spans source-line boundaries.
+    #[test]
+    fn text_reflow_across_lines_is_not_semantic() {
+        let one = "<p>Hello world</p>";
+        for reflowed in ["<p>Hello\nworld</p>", "<p>Hello  \n   world</p>", "<p>Hello\n\nworld</p>"] {
+            assert_eq!(facts(reflowed), facts(one), "{reflowed:?}");
+            assert_eq!(tree_hash(reflowed), tree_hash(one), "{reflowed:?}");
+        }
+        let facts_multi = text_facts("<p>Hello\n  world</p>");
+        assert_eq!(facts_multi, vec![("Hello world".to_string(), serde_json::json!({
+            "start_line": 0, "start_col": 3, "end_line": 1, "end_col": 7}))]);
+        assert_ne!(tree_hash("<p>Hello\nworld</p>"), tree_hash("<p>Hello\nthere</p>"));
+        // Markup between lines still separates text runs.
+        assert_eq!(text_facts("<p>Hello</p>\n<p>world</p>").len(), 2);
+        assert_eq!(text_facts("<p>Hello\n<br>\nworld</p>").len(), 2);
+        // An unterminated multi-line tag keeps its interpolations.
+        assert!(facts("<div\n a={value}\n").contains(&("interpolation".into(), "value".into())));
     }
 }
