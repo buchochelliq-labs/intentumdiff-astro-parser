@@ -774,6 +774,8 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
     let mut raw_text_tag: Option<String> = None;
     // An opening tag whose `>` is on a later line (multi-line attributes).
     let mut pending_tag: Option<PendingTag> = None;
+    // Interpolations of a multi-line opening tag, emitted after its element.
+    let mut deferred_interpolations: Vec<(String, u32, usize, usize)> = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
         let absolute_line = start_line + line_idx as u32;
         let mut rest = line;
@@ -793,7 +795,8 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                 let close_col = close - line_offset;
                 markup_ranges.push((0, close_col + 1));
                 rest = &line[close_col + 1..];
-                let pending = pending_tag.take().expect("pending tag");
+                let mut pending = pending_tag.take().expect("pending tag");
+                deferred_interpolations.append(&mut pending.interpolations);
                 let at = |offset: usize| pending.position(offset);
                 let child_id = format!("{}.{}", id_prefix, children.len());
                 if let Some((element, raw_name)) = open_tag_element(
@@ -883,6 +886,7 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                         lines: vec![(0, absolute_line)],
                         first_col: open_abs + 1,
                         open_col: open_abs as u32,
+                        interpolations: Vec::new(),
                     });
                 }
                 break;
@@ -890,10 +894,22 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
         }
         let visible = std::str::from_utf8(&interpolation_visible)
             .expect("masking complete UTF-8 source ranges preserves encoding");
-        for (label, start, end) in extract_brace_labels(visible) {
+        let mut interpolations: Vec<(String, u32, usize, usize)> = extract_brace_labels(visible)
+            .into_iter()
+            .map(|(label, start, end)| (label, absolute_line, start, end))
+            .collect();
+        if let Some(pending) = &mut pending_tag {
+            // Emit them after the tag's element once it closes, in the same
+            // order as the single-line form (elements first, then
+            // interpolations).
+            pending.interpolations.append(&mut interpolations);
+        } else {
+            interpolations.splice(0..0, deferred_interpolations.drain(..));
+        }
+        for (label, line_no, start, end) in interpolations {
             let child_id = format!("{}.{}", id_prefix, children.len());
             children.push(make_leaf(
-                &child_id, "interpolation", label, absolute_line,
+                &child_id, "interpolation", label, line_no,
                 start as u32, end as u32,
             ));
         }
@@ -904,6 +920,14 @@ fn extract_template_children(content: &str, start_line: u32, id_prefix: &str) ->
                 start as u32, end as u32,
             ));
         }
+    }
+    // An opening tag left unterminated at end of input keeps its
+    // interpolation facts (as before multi-line tags were tracked).
+    for (label, line_no, start, end) in pending_tag.map(|p| p.interpolations).unwrap_or_default() {
+        let child_id = format!("{}.{}", id_prefix, children.len());
+        children.push(make_leaf(
+            &child_id, "interpolation", label, line_no, start as u32, end as u32,
+        ));
     }
     children
 }
@@ -917,6 +941,8 @@ struct PendingTag {
     /// Source column of `text[0]` on the first line.
     first_col: usize,
     open_col: u32,
+    /// Interpolations seen on lines while the tag was open.
+    interpolations: Vec<(String, u32, usize, usize)>,
 }
 
 impl PendingTag {
@@ -1913,5 +1939,18 @@ mod tests {
         assert_eq!(nodes_of_type(&tree, "attribute")[0]["position"], span(1, 1, 14));
         // A self-closing multi-line <script ... /> does not open raw text.
         assert_eq!(text_facts("<script\n src=\"a.js\" />\n<p>shown</p>\n")[0].0, "shown");
+    }
+
+    // Issue #20: JSX inside a multi-line opening tag's attribute is kept.
+    #[test]
+    fn multiline_opening_tag_keeps_attribute_jsx() {
+        let single = "<div prop={items.map(x => <span title=\"kept\">{x}</span>)}>After</div>\n";
+        let multi = "<div\n prop={items.map(x => <span title=\"kept\">{x}</span>)}\n>After</div>\n";
+        assert_eq!(facts(multi), facts(single));
+        assert_eq!(tree_hash(multi), tree_hash(single));
+        let labels: Vec<String> = facts(multi).into_iter().map(|(_, l)| l).collect();
+        assert!(labels.iter().any(|l| l.contains("<span title=\"kept\">")), "{labels:?}");
+        assert_ne!(tree_hash(multi), tree_hash(&multi.replace("kept", "gone")));
+        assert_eq!(text_facts(multi).into_iter().map(|(l, _)| l).collect::<Vec<_>>(), ["After"]);
     }
 }
